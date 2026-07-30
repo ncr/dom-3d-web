@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Wizualizacja 3D</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    display: grid; place-items: center; font-family: system-ui, sans-serif;
+    background: radial-gradient(120% 120% at 50% 0%, #1b2433 0%, #0e1218 60%);
+    color: #e8edf2;
+  }
+  .card {
+    width: min(340px, calc(100vw - 32px)); padding: 28px 26px;
+    background: rgba(17, 21, 27, .85); backdrop-filter: blur(14px);
+    border: 1px solid rgba(255, 255, 255, .1); border-radius: 18px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, .5);
+  }
+  .card h1 { font-size: 17px; margin-bottom: 4px; }
+  .card p { font-size: 12.5px; color: #9aa7b4; margin-bottom: 18px; }
+  input[type="password"] {
+    width: 100%; padding: 12px 12px; font-size: 16px; border-radius: 11px;
+    border: 1px solid rgba(255, 255, 255, .18); background: #232a33; color: #e8edf2;
+  }
+  label { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: #9aa7b4; margin: 12px 0 16px; }
+  button {
+    width: 100%; padding: 12px; font-size: 15px; border: none; border-radius: 11px;
+    background: #3d6fb4; color: #fff; cursor: pointer; font-family: inherit;
+  }
+  button:disabled { opacity: .6; }
+  #err { color: #ff8a8a; font-size: 12.5px; margin-top: 10px; display: none; }
+</style>
+</head>
+<body>
+  <form class="card" id="f">
+    <h1>🏠 Wizualizacja 3D</h1>
+    <p>Strona prywatna — podaj hasło dostępu.</p>
+    <input id="pass" type="password" autocomplete="current-password" placeholder="hasło" autofocus />
+    <label><input id="remember" type="checkbox" checked /> zapamiętaj na tym urządzeniu</label>
+    <button id="go">Wejdź</button>
+    <div id="err"></div>
+  </form>
+<script type="module">
+const META = await fetch('./crypt-meta.json').then((r) => r.json());
+const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const b64e = (b) => btoa(String.fromCharCode(...new Uint8Array(b)));
+
+async function deriveKey(pass) {
+  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: b64d(META.salt), iterations: META.iter, hash: 'SHA-256' },
+    km, { name: 'AES-GCM', length: 256 }, true, ['decrypt']);
+}
+async function decrypt(key, url) {
+  const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.slice(0, 12) }, key, buf.slice(12));
+}
+
+async function boot(key) {
+  const pageBuf = await decrypt(key, './page.enc');           // zły klucz → wyjątek
+  window.__cryptKey = key;
+  const doc = new DOMParser().parseFromString(new TextDecoder().decode(pageBuf), 'text/html');
+  // znajdź moduł aplikacji ZANIM podmienimy dokument
+  const entry = [...doc.querySelectorAll('script[src]')].map((s) => s.getAttribute('src'))
+    .find((s) => /assets\/.+\.js$/.test(s));
+  // style + treść strony
+  document.title = doc.title;
+  for (const st of doc.querySelectorAll('style')) document.head.appendChild(st.cloneNode(true));
+  doc.querySelectorAll('script').forEach((s) => s.remove());
+  document.body.innerHTML = doc.body.innerHTML;
+  document.body.style.background = '';
+  document.body.style.display = '';
+  // odszyfruj i uruchom bundle
+  const js = await decrypt(key, './' + entry + '.enc');
+  const blob = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
+  await import(blob);
+}
+
+// zapamiętany klucz → cicha próba
+const saved = localStorage.getItem('crypt-key');
+if (saved) {
+  try {
+    const key = await crypto.subtle.importKey('raw', b64d(saved), 'AES-GCM', true, ['decrypt']);
+    await boot(key);
+  } catch { localStorage.removeItem('crypt-key'); }
+}
+
+document.getElementById('f')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('go'), err = document.getElementById('err');
+  btn.disabled = true; btn.textContent = 'Odszyfrowywanie…'; err.style.display = 'none';
+  try {
+    const key = await deriveKey(document.getElementById('pass').value);
+    if (document.getElementById('remember').checked)
+      localStorage.setItem('crypt-key', b64e(await crypto.subtle.exportKey('raw', key)));
+    await boot(key);
+  } catch {
+    err.textContent = 'Nieprawidłowe hasło.';
+    err.style.display = 'block';
+    btn.disabled = false; btn.textContent = 'Wejdź';
+  }
+});
+</script>
+</body>
+</html>
