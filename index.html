@@ -40,10 +40,11 @@
     <p>Strona prywatna — podaj hasło dostępu.</p>
     <input id="pass" type="password" autocomplete="current-password" placeholder="hasło" autofocus />
     <label><input id="remember" type="checkbox" checked /> zapamiętaj na tym urządzeniu</label>
-    <button id="go">Wejdź</button>
+    <button id="go" disabled>Ładowanie…</button>
     <div id="err"></div>
   </form>
 <script type="module">
+document.getElementById('f').addEventListener('submit', (event) => event.preventDefault());
 const META = await fetch('./crypt-meta.json').then((r) => r.json());
 const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const b64e = (b) => btoa(String.fromCharCode(...new Uint8Array(b)));
@@ -105,6 +106,8 @@ document.getElementById('f')?.addEventListener('submit', async (e) => {
     btn.disabled = false; btn.textContent = 'Wejdź';
   }
 });
+const readyButton = document.getElementById('go');
+if (readyButton) { readyButton.disabled = false; readyButton.textContent = 'Wejdź'; }
 </script>
 </body>
 </html>
