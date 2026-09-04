@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Wizualizacja 3D</title>
-<style>
+<style id="gate-style">
   :root { color-scheme: dark; }
   * { margin: 0; box-sizing: border-box; }
   html, body { height: 100%; }
@@ -68,6 +68,8 @@ async function boot(key) {
     .find((s) => /assets\/.+\.js$/.test(s));
   // style + treść strony
   document.title = doc.title;
+  document.getElementById('gate-style')?.remove();
+  document.querySelector('meta[name="viewport"]').content = doc.querySelector('meta[name="viewport"]').content;
   for (const st of doc.querySelectorAll('style')) document.head.appendChild(st.cloneNode(true));
   doc.querySelectorAll('script').forEach((s) => s.remove());
   document.body.innerHTML = doc.body.innerHTML;
