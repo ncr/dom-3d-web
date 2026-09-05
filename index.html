@@ -45,7 +45,7 @@
   </form>
 <script type="module">
 document.getElementById('f').addEventListener('submit', (event) => event.preventDefault());
-const META = await fetch('./crypt-meta.json').then((r) => r.json());
+const META = await fetch('./crypt-meta.json', { cache: 'no-cache' }).then((r) => { if (!r.ok) throw new Error('Nie udało się pobrać konfiguracji.'); return r.json(); });
 const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const b64e = (b) => btoa(String.fromCharCode(...new Uint8Array(b)));
 
@@ -60,8 +60,9 @@ async function decrypt(key, url) {
   return crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.slice(0, 12) }, key, buf.slice(12));
 }
 
-async function boot(key) {
+async function boot(key, onUnlocked) {
   const pageBuf = await decrypt(key, './page.enc');           // zły klucz → wyjątek
+  await onUnlocked?.(); // Persist only a key that successfully decrypted this deployment.
   window.__cryptKey = key;
   const doc = new DOMParser().parseFromString(new TextDecoder().decode(pageBuf), 'text/html');
   // znajdź moduł aplikacji ZANIM podmienimy dokument
@@ -82,13 +83,22 @@ async function boot(key) {
   await import(blob);
 }
 
-// zapamiętany klucz → cicha próba
-const saved = localStorage.getItem('crypt-key');
+// Storage can be disabled by the browser; unlocking must still work.
+function storage(kind, action, value) {
+  try { return window[kind][action]('crypt-key', value); } catch { return null; }
+}
+const saved = storage('sessionStorage', 'getItem') || storage('localStorage', 'getItem');
 if (saved) {
   try {
     const key = await crypto.subtle.importKey('raw', b64d(saved), 'AES-GCM', true, ['decrypt']);
     await boot(key);
-  } catch { localStorage.removeItem('crypt-key'); }
+  } catch (error) {
+    // A network or application error does not mean the saved key is invalid.
+    if (['OperationError', 'DataError', 'InvalidCharacterError'].includes(error.name)) {
+      storage('sessionStorage', 'removeItem');
+      storage('localStorage', 'removeItem');
+    }
+  }
 }
 
 document.getElementById('f')?.addEventListener('submit', async (e) => {
@@ -97,9 +107,13 @@ document.getElementById('f')?.addEventListener('submit', async (e) => {
   btn.disabled = true; btn.textContent = 'Odszyfrowywanie…'; err.style.display = 'none';
   try {
     const key = await deriveKey(document.getElementById('pass').value);
-    if (document.getElementById('remember').checked)
-      localStorage.setItem('crypt-key', b64e(await crypto.subtle.exportKey('raw', key)));
-    await boot(key);
+    const remember = document.getElementById('remember').checked;
+    await boot(key, async () => {
+      const raw = b64e(await crypto.subtle.exportKey('raw', key));
+      storage('sessionStorage', 'setItem', raw);
+      if (remember) storage('localStorage', 'setItem', raw);
+      else storage('localStorage', 'removeItem');
+    });
   } catch {
     err.textContent = 'Nieprawidłowe hasło.';
     err.style.display = 'block';
