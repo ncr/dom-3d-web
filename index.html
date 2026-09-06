@@ -45,7 +45,8 @@
   </form>
 <script type="module">
 document.getElementById('f').addEventListener('submit', (event) => event.preventDefault());
-const META = await fetch('./crypt-meta.json', { cache: 'no-cache' }).then((r) => { if (!r.ok) throw new Error('Nie udało się pobrać konfiguracji.'); return r.json(); });
+const nativeFetch=window.fetch.bind(window);
+const META = await nativeFetch('./crypt-meta.json', { cache: 'no-cache' }).then((r) => { if (!r.ok) throw new Error('Nie udało się pobrać konfiguracji.'); return r.json(); });
 const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const b64e = (b) => btoa(String.fromCharCode(...new Uint8Array(b)));
 
@@ -56,31 +57,100 @@ async function deriveKey(pass) {
     km, { name: 'AES-GCM', length: 256 }, true, ['decrypt']);
 }
 async function decrypt(key, url) {
-  const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  const response=await nativeFetch(url,{cache:'no-cache'});
+  if(!response.ok)throw new Error(`Nie udało się pobrać strony (${response.status}).`);
+  const buf = new Uint8Array(await response.arrayBuffer());
   return crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.slice(0, 12) }, key, buf.slice(12));
 }
 
+// Use IndexedDB independently of HTTP and service-worker caches.
+// Store only ciphertext; all callers still authenticate and decrypt every read.
+async function openAssetCache(name){
+  const db=await new Promise((resolve,reject)=>{
+    const request=indexedDB.open(name,1);let abandoned=false;
+    const timer=setTimeout(()=>{abandoned=true;resolve(null);},2500);
+    request.onupgradeneeded=()=>request.result.createObjectStore('assets');
+    request.onsuccess=()=>{clearTimeout(timer);if(abandoned)request.result.close();else resolve(request.result);};
+    request.onerror=()=>{clearTimeout(timer);reject(request.error);};
+    request.onblocked=()=>{clearTimeout(timer);abandoned=true;resolve(null);};
+  });
+  if(!db)return null;
+  db.onversionchange=()=>db.close();
+  const run=(mode,action)=>new Promise((resolve,reject)=>{
+    const tx=db.transaction('assets',mode),request=action(tx.objectStore('assets'));
+    tx.oncomplete=()=>resolve(request.result);
+    tx.onabort=tx.onerror=()=>reject(tx.error||new Error('Asset cache unavailable'));
+  });
+  return {
+    async match(url){const bytes=await run('readonly',s=>s.get(url));return bytes?new Response(bytes):undefined;},
+    async put(url,response){const bytes=await response.arrayBuffer();await run('readwrite',s=>s.put(bytes,url));},
+    delete:url=>run('readwrite',s=>s.delete(url)),
+    async keys(){return (await run('readonly',s=>s.getAllKeys())).map(url=>({url}));},
+  };
+}
+
+function assetLoader(key,manifest){
+  const stats=window.__assetCacheStats={hits:0,downloads:0,downloadBytes:0,cacheErrors:0};
+  const cacheName='dom-3d-assets-v1:'+new URL('.',location.href).pathname;
+  const cachePromise=openAssetCache(cacheName).catch(()=>{stats.cacheErrors++;return null;});
+  const pending=new Map();
+  const decryptBytes=bytes=>crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(0,12)},key,bytes.slice(12));
+  async function load(path){
+    const logical='./'+path.replace(/^\.\//,''),entry=manifest[logical];
+    if(!entry)return decrypt(key,logical+'.enc'); // Existing pre-manifest deployments.
+    const url=new URL(entry.url,location.href).href,cache=await cachePromise;
+    if(cache){
+      try{
+        const hit=await cache.match(url);
+        if(hit){const plain=await decryptBytes(new Uint8Array(await hit.arrayBuffer()));stats.hits++;return plain;}
+      }catch{stats.cacheErrors++;try{await cache.delete(url);}catch{}}
+    }
+    const response=await nativeFetch(url,{cache:'force-cache'});
+    if(!response.ok)throw new Error(`Nie udało się pobrać zasobu (${response.status}).`);
+    const bytes=new Uint8Array(await response.arrayBuffer());
+    const hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(n=>n.toString(16).padStart(2,'0')).join('');
+    if(hash!==entry.hash)throw new Error('Niepełny zasób — odśwież stronę, aby spróbować ponownie.');
+    const plain=await decryptBytes(bytes);
+    stats.downloads++;stats.downloadBytes+=bytes.length;
+    if(cache){try{await cache.put(url,new Response(bytes,{headers:{'Content-Type':'application/octet-stream'}}));}catch{stats.cacheErrors++;}}
+    return plain;
+  }
+  const get=path=>{
+    if(!pending.has(path))pending.set(path,load(path).finally(()=>pending.delete(path)));
+    return pending.get(path);
+  };
+  // Keep only this deployment's resources; a quota/storage denial never prevents loading.
+  get.prune=async()=>{
+    try{const cache=await cachePromise;if(!cache)return;const keep=new Set(Object.values(manifest).map(e=>new URL(e.url,location.href).href));
+      for(const request of await cache.keys())if(!keep.has(request.url))await cache.delete(request.url);
+    }catch{stats.cacheErrors++;}
+  };
+  return get;
+}
+
 async function boot(key, onUnlocked) {
-  const pageBuf = await decrypt(key, './page.enc');           // zły klucz → wyjątek
-  await onUnlocked?.(); // Persist only a key that successfully decrypted this deployment.
-  window.__cryptKey = key;
+  const pageBuf = await decrypt(key, './page.enc');
+  await onUnlocked?.();
   const doc = new DOMParser().parseFromString(new TextDecoder().decode(pageBuf), 'text/html');
-  // znajdź moduł aplikacji ZANIM podmienimy dokument
-  const entry = [...doc.querySelectorAll('script[src]')].map((s) => s.getAttribute('src'))
-    .find((s) => /assets\/.+\.js$/.test(s));
-  // style + treść strony
+  const manifest=JSON.parse(doc.querySelector('#encrypted-assets')?.textContent||'{}');
+  const load=assetLoader(key,manifest);
+  const entry = [...doc.querySelectorAll('script[src]')].map(s=>s.getAttribute('src')).find(s=>/assets\/.+\.js$/.test(s));
+  if(!entry)throw new Error('Brak pliku aplikacji.');
+  const sheets=[...doc.querySelectorAll('link[rel="stylesheet"]')].map(s=>s.getAttribute('href'));
+  const [js,...styles]=await Promise.all([load(entry),...sheets.map(load)]);
+  window.__cryptKey=key;window.__cryptDecrypt=load;
   document.title = doc.title;
   document.getElementById('gate-style')?.remove();
   document.querySelector('meta[name="viewport"]').content = doc.querySelector('meta[name="viewport"]').content;
   for (const st of doc.querySelectorAll('style')) document.head.appendChild(st.cloneNode(true));
-  doc.querySelectorAll('script').forEach((s) => s.remove());
+  for(const css of styles){const st=document.createElement('style');st.textContent=new TextDecoder().decode(css);document.head.appendChild(st);}
+  doc.querySelectorAll('script').forEach(s=>s.remove());
   document.body.innerHTML = doc.body.innerHTML;
   document.body.style.background = '';
   document.body.style.display = '';
-  // odszyfruj i uruchom bundle
-  const js = await decrypt(key, './' + entry + '.enc');
   const blob = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
-  await import(blob);
+  try{await import(blob);}finally{URL.revokeObjectURL(blob);}
+  if(Object.keys(manifest).length)void load.prune();
 }
 
 // Storage can be disabled by the browser; unlocking must still work.
@@ -114,8 +184,8 @@ document.getElementById('f')?.addEventListener('submit', async (e) => {
       if (remember) storage('localStorage', 'setItem', raw);
       else storage('localStorage', 'removeItem');
     });
-  } catch {
-    err.textContent = 'Nieprawidłowe hasło.';
+  } catch (error) {
+    err.textContent = error.name==='OperationError'?'Nieprawidłowe hasło.':'Nie udało się załadować strony. Sprawdź połączenie i spróbuj ponownie.';
     err.style.display = 'block';
     btn.disabled = false; btn.textContent = 'Wejdź';
   }
