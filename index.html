@@ -96,7 +96,7 @@ function assetLoader(key,manifest){
   const cacheName='dom-3d-assets-v1:'+new URL('.',location.href).pathname;
   const cachePromise=openAssetCache(cacheName).catch(()=>{stats.cacheErrors++;return null;});
   const pending=new Map(),reserved=new Set(),loadedBytes=new Map(),cachedPaths=new Set();
-  const account=(path,bytes)=>{const previous=loadedBytes.get(path)||0;progress.loaded+=Math.max(previous,bytes)-previous;loadedBytes.set(path,Math.max(previous,bytes));};
+  const account=(path,bytes,cached=false)=>{const previous=loadedBytes.get(path)||0;progress.loaded+=Math.max(previous,bytes)-previous;loadedBytes.set(path,Math.max(previous,bytes));window.dispatchEvent(new CustomEvent('asset-load-progress',{detail:{path,loaded:bytes,total:manifest[path]?.bytes||bytes,cached}}));};
   const reserve=path=>{const logical='./'+path.replace(/^\.\//,'');if(manifest[logical]&&!reserved.has(logical)){reserved.add(logical);progress.total+=manifest[logical].bytes;}};
   window.__reserveAssets=paths=>paths.forEach(reserve);
   const decryptBytes=bytes=>crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(0,12)},key,bytes.slice(12));
@@ -109,7 +109,7 @@ function assetLoader(key,manifest){
     if(cache){
       try{
         const hit=await cache.match(url);
-        if(hit){const plain=await decryptBytes(new Uint8Array(await hit.arrayBuffer()));stats.hits++;account(logical,entry.bytes);if(!cachedPaths.has(logical)){cachedPaths.add(logical);progress.cached+=entry.bytes;}return plain;}
+        if(hit){const plain=await decryptBytes(new Uint8Array(await hit.arrayBuffer()));stats.hits++;account(logical,entry.bytes,true);if(!cachedPaths.has(logical)){cachedPaths.add(logical);progress.cached+=entry.bytes;}return plain;}
       }catch{stats.cacheErrors++;try{await cache.delete(url);}catch{}}
     }
     const response=await nativeFetch(url,{cache:'force-cache'});
