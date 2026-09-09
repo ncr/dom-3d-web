@@ -41,6 +41,7 @@
     <input id="pass" type="password" autocomplete="current-password" placeholder="hasło" autofocus />
     <label><input id="remember" type="checkbox" checked /> zapamiętaj na tym urządzeniu</label>
     <button id="go" disabled>Ładowanie…</button>
+    <progress id="boot-progress" max="100" hidden aria-label="Postęp ładowania strony" style="width:100%;margin-top:16px;accent-color:#66c6a2"></progress>
     <div id="err"></div>
   </form>
 <script type="module">
@@ -90,30 +91,39 @@ async function openAssetCache(name){
 }
 
 function assetLoader(key,manifest){
+  const progress=window.__loadingProgress={loaded:0,total:0,active:0,cached:0};
   const stats=window.__assetCacheStats={hits:0,downloads:0,downloadBytes:0,cacheErrors:0};
   const cacheName='dom-3d-assets-v1:'+new URL('.',location.href).pathname;
   const cachePromise=openAssetCache(cacheName).catch(()=>{stats.cacheErrors++;return null;});
-  const pending=new Map();
+  const pending=new Map(),reserved=new Set(),loadedBytes=new Map(),cachedPaths=new Set();
+  const account=(path,bytes)=>{const previous=loadedBytes.get(path)||0;progress.loaded+=Math.max(previous,bytes)-previous;loadedBytes.set(path,Math.max(previous,bytes));};
+  const reserve=path=>{const logical='./'+path.replace(/^\.\//,'');if(manifest[logical]&&!reserved.has(logical)){reserved.add(logical);progress.total+=manifest[logical].bytes;}};
+  window.__reserveAssets=paths=>paths.forEach(reserve);
   const decryptBytes=bytes=>crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(0,12)},key,bytes.slice(12));
   async function load(path){
     const logical='./'+path.replace(/^\.\//,''),entry=manifest[logical];
     if(!entry)return decrypt(key,logical+'.enc'); // Existing pre-manifest deployments.
+    reserve(path);progress.active++;
+    try {
     const url=new URL(entry.url,location.href).href,cache=await cachePromise;
     if(cache){
       try{
         const hit=await cache.match(url);
-        if(hit){const plain=await decryptBytes(new Uint8Array(await hit.arrayBuffer()));stats.hits++;return plain;}
+        if(hit){const plain=await decryptBytes(new Uint8Array(await hit.arrayBuffer()));stats.hits++;account(logical,entry.bytes);if(!cachedPaths.has(logical)){cachedPaths.add(logical);progress.cached+=entry.bytes;}return plain;}
       }catch{stats.cacheErrors++;try{await cache.delete(url);}catch{}}
     }
     const response=await nativeFetch(url,{cache:'force-cache'});
     if(!response.ok)throw new Error(`Nie udało się pobrać zasobu (${response.status}).`);
-    const bytes=new Uint8Array(await response.arrayBuffer());
+    const chunks=[];let received=0;const reader=response.body.getReader();
+    while(true){const {done,value}=await reader.read();if(done)break;chunks.push(value);received+=value.length;account(logical,received);}
+    const bytes=new Uint8Array(received);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
     const hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(n=>n.toString(16).padStart(2,'0')).join('');
     if(hash!==entry.hash)throw new Error('Niepełny zasób — odśwież stronę, aby spróbować ponownie.');
     const plain=await decryptBytes(bytes);
     stats.downloads++;stats.downloadBytes+=bytes.length;
     if(cache){try{await cache.put(url,new Response(bytes,{headers:{'Content-Type':'application/octet-stream'}}));}catch{stats.cacheErrors++;}}
     return plain;
+    } finally {progress.active--;}
   }
   const get=path=>{
     if(!pending.has(path))pending.set(path,load(path).finally(()=>pending.delete(path)));
@@ -137,7 +147,10 @@ async function boot(key, onUnlocked) {
   const entry = [...doc.querySelectorAll('script[src]')].map(s=>s.getAttribute('src')).find(s=>/assets\/.+\.js$/.test(s));
   if(!entry)throw new Error('Brak pliku aplikacji.');
   const sheets=[...doc.querySelectorAll('link[rel="stylesheet"]')].map(s=>s.getAttribute('href'));
-  const [js,...styles]=await Promise.all([load(entry),...sheets.map(load)]);
+  const go=document.getElementById('go'),bar=document.getElementById('boot-progress');if(bar)bar.hidden=false;
+  const bootProgress=setInterval(()=>{const s=window.__loadingProgress;if(go&&s)go.textContent=`Ładowanie ${(s.loaded/1e6).toFixed(1)} / ${(s.total/1e6).toFixed(1)} MB`;if(bar&&s)bar.value=s.total?s.loaded/s.total*100:0;},100);
+  let js,styles;
+  try{[js,...styles]=await Promise.all([load(entry),...sheets.map(load)]);}finally{clearInterval(bootProgress);}
   window.__cryptKey=key;window.__cryptDecrypt=load;
   document.title = doc.title;
   document.getElementById('gate-style')?.remove();
